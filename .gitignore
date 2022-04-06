@@ -1,0 +1,4 @@
+# For data analysis
+*.csv
+dataset/
+submit/
