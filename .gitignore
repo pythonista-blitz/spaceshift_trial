@@ -2,3 +2,5 @@
 *.csv
 dataset/
 submit/
+model/
+test.py

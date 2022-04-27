@@ -1,69 +1,58 @@
 # import
-import copy
-import datetime
+import logging
 import os
-import random
-import shutil
-import sys
-import time
 import warnings
-import zipfile
-from collections import defaultdict
+from argparse import ArgumentParser
 from pathlib import Path
+from random import random
 
-import albumentations as A
-import cv2
-import matplotlib.pyplot as plt
-import mlflow
+import ignite
 import numpy as np
-# import optuna
-import pandas as pd
-import sklearn
+import seaborn as sns
 import torch
 import torch.nn.functional as F
-from albumentations import (Compose, GaussNoise, HorizontalFlip, Normalize,
-                            Resize, ShiftScaleRotate)
+from albumentations import (Compose, Flip, GaussNoise, Normalize, Resize,
+                            Rotate, ShiftScaleRotate)
 from albumentations.pytorch import ToTensorV2
-from PIL import Image
+from ignite.contrib.handlers.mlflow_logger import *
+from ignite.engine import (Events, create_supervised_evaluator,
+                           create_supervised_trainer)
+from ignite.handlers import EarlyStopping
+from matplotlib import pyplot as plt
 from skimage import io, transform
-# import xgboost
-# from matplotlib import pyplot as plt
-# from prettytable import RANDOM
-from sklearn.metrics import fbeta_score
-from sklearn.model_selection import train_test_split
-from torch import nn
-from torch.autograd import Variable
-from torch.nn import (BatchNorm2d, Conv2d, CrossEntropyLoss, Dropout, Linear,
-                      MaxPool2d, Module, ReLU, Sequential, Softmax)
-from torch.optim import SGD, Adam
+from torch import nn, no_grad
 from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision import transforms, utils
+from torchmetrics import Accuracy, Precision, Recall
 from tqdm import tqdm as tqdm
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 warnings.simplefilter("ignore", category=DeprecationWarning)
-# optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# 定数
+# constants
+BATCH_SIZE = 1
 MEAN = 0
 STD = 1
-SPLIT_RATIO = 0.25
+RANDOM_SEED = 126
 CHANNEL_LIST = ["0_VH", "0_VV", "1_VH", "1_VV"]
-
-# 画像データオーグメンテーション
 
 
 def get_train_transform():
-
-    return A.Compose(
+    """
+    画像データオーグメンテーション
+    """
+    return Compose(
         [
             # リサイズ
-            A.Resize(256, 256),
-            # 正規化(予め平均と標準偏差は計算しておく)
-            # A.Normalize(mean=MEAN, std=STD),
+            Resize(256, 256),
             # ランダム回転
-            A.Rotate(p=1),
+            Rotate(p=1),
+            # 水平、垂直、水平垂直のいずれかにランダム反転
+            Flip(p=1),
+            # 正規化(予め平均と標準偏差は計算しておく？)
+            # albumentationsは値域が0~255のunit8を返すので
+            # std=1, mean=0で正規化を施してfloat32型にしておく
+            Normalize(mean=MEAN, std=STD),
             # テンソル化
             ToTensorV2()
         ],
@@ -74,8 +63,11 @@ def get_train_transform():
         })
 
 
-# pytorchのデータセットクラスを継承
 class LoadDataSet(Dataset):
+    """
+    pytorchのデータセットクラスを継承
+    """
+
     def __init__(self, path, transforms=None):
         self.path = path
         self.folders = os.listdir(os.path.join(path, "train_images/"))
@@ -108,76 +100,30 @@ class LoadDataSet(Dataset):
         img_1_vv = io.imread(image_1_vv_path, 0).astype("float32")
 
         # アノテーションデータの取得
-        mask = np.zeros((256, 256, 1), dtype=np.bool)
-        mask_ = io.imread(mask_path)
-        mask_ = transform.resize(mask_, (256, 256))
-        mask_ = np.expand_dims(mask_, axis=-1)
-        mask = np.maximum(mask, mask_)
+        raw_mask = io.imread(mask_path).astype('float32')
 
         augmented = self.transforms(
-            image=img_0_vh, image0=img_0_vv, image1=img_1_vh, image2=img_1_vv, mask=mask)
+            image=img_0_vh, image0=img_0_vv, image1=img_1_vh, image2=img_1_vv, mask=raw_mask)
 
-        size = augmented["image"].size()
-        print(f"train image size is {size}\n")
-
+        # imgs = [augmented["image"].float(), augmented["image0"].float(),
+        #         augmented["image1"].float(), augmented["image2"].float()]
+        # mask = augmented["mask"].float()
         imgs = [augmented["image"], augmented["image0"],
                 augmented["image1"], augmented["image2"]]
+        _mask = augmented["mask"]
+        mask = torch.unsqueeze(_mask, 0)
 
         img = torch.cat(imgs, dim=0)
-        mask = augmented["mask"]
 
         return (img, mask)
 
 
-def format_image(img):
-    # 下は画像拡張での正規化を元に戻しています
-    # img = STD * img + MEAN
-    # img = img * 255
-    img = img.to('cpu').detach().numpy().copy().transpose((1, 2, 0))
-    img = img.astype(np.uint8)
-    return img
-
-
-def visualize_dataset(n_images, predict=None):
-    image_idx_list = random.sample(range(0, 28), n_images)
-    figure, ax = plt.subplots(nrows=n_images, ncols=5, figsize=(
-        10, 10), gridspec_kw={'wspace': 0.02, 'hspace': -0.6})
-    print(f"selected index: {image_idx_list}\n")
-
-    for row, idx in enumerate(image_idx_list):
-
-        image, mask = train_dataset.__getitem__(idx)
-        images = torch.tensor_split(image, len(CHANNEL_LIST), dim=0)
-
-        # train image
-        for col, (title, image) in enumerate(zip(CHANNEL_LIST, images)):
-            image = format_image(image)
-            ax[row, col].imshow(image, cmap="gray")
-
-            ax[row, 0].set_ylabel(f"idx:{idx}", fontsize=8)
-            if row == 0:
-                ax[row, col].set_title(title, fontsize=8)
-                ax[row, col].xaxis.tick_top()
-            ax[row, col].xaxis.set_ticks([])
-            ax[row, col].yaxis.set_ticks([])
-
-        # annotation mask
-        ax[row, -1].imshow(mask, cmap="gray")
-
-        if row == 0:
-            ax[row, -1].set_title("Label Mask", fontsize=8)
-
-        ax[row, -1].yaxis.set_ticks([])
-        ax[row, -1].xaxis.set_ticks([])
-
-    plt.tight_layout()
-    plt.show()
-
-# UNet
-
-
 class UNet(nn.Module):
-    def __init__(self, input_channels, output_channels):
+    """
+    U-netクラス
+    """
+
+    def __init__(self, input_channels, num_classes):
         super().__init__()
         # 資料中の『FCN』に当たる部分
         self.conv1 = conv_bn_relu(input_channels, 64)
@@ -196,17 +142,19 @@ class UNet(nn.Module):
         self.conv8 = conv_bn_relu(256, 128)
         self.up_pool9 = up_pooling(128, 64)
         self.conv9 = conv_bn_relu(128, 64)
-        self.conv10 = nn.Conv2d(64, output_channels, 1)
+        self.conv10 = nn.Conv2d(64, num_classes, 1)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_out')
+                # パラメータの初期化 TODO Heの初期値を用いる理由は？
+                nn.init.kaiming_normal_(m.weight.data, a=0, mode="fan_out")
                 if m.bias is not None:
                     m.bias.data.zero_()
 
     def forward(self, x):
-        # 正規化
-        x = x/255.
+        """
+        順伝搬処理の定義
+        """
 
         # 資料中の『FCN』に当たる部分
         x1 = self.conv1(x)
@@ -241,10 +189,11 @@ class UNet(nn.Module):
 
         return output
 
-# 畳み込みとバッチ正規化と活性化関数Reluをまとめている
-
 
 def conv_bn_relu(in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+    """
+    畳み込みとバッチ正規化と活性化関数Reluをまとめている
+    """
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
                   stride=stride, padding=padding),
@@ -272,13 +221,15 @@ def up_pooling(in_channels, out_channels, kernel_size=2, stride=2):
 
 
 class DiceBCELoss(nn.Module):
+    """
+    Binary Cross Entropy + DiceLoss
+    DiceLoss = 1 - DiceCoefficient
+    """
+
     def __init__(self, weight=None, size_average=True):
         super(DiceBCELoss, self).__init__()
 
     def forward(self, inputs, targets, smooth=1):
-
-        # comment out if your model contains a sigmoid or equivalent activation layer
-        inputs = F.sigmoid(inputs)
 
         # flatten label and prediction tensors
         inputs = inputs.view(-1)
@@ -287,55 +238,316 @@ class DiceBCELoss(nn.Module):
         intersection = (inputs * targets).sum()
         dice_loss = 1 - (2.*intersection + smooth) / \
             (inputs.sum() + targets.sum() + smooth)
-        BCE = F.binary_cross_entropy(inputs, targets, reduction='mean')
+        BCE = F.binary_cross_entropy(inputs, targets, reduction="mean")
         Dice_BCE = BCE + dice_loss
 
         return Dice_BCE
 
 
-#
-class DiceLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceLoss, self).__init__()
+class FBetaScore(nn.Module):
+    """
+    重み付きF Score算出関数
+    beta = 1の時Dice係数と同じ
+    smoothはゼロ除算対策
+    """
+
+    def __init__(self, beta: float = 1., threshold: float = 0.5):
+        super(FBetaScore, self).__init__()
+        self.beta = beta
+        self.threshold = threshold
 
     def forward(self, inputs, targets, smooth=1):
-
-        # comment out if your model contains a sigmoid or equivalent activation layer
-        # inputs = F.sigmoid(inputs)
+        # Binarize probablity
+        inputs = torch.where(inputs < self.threshold, 0, 1)
 
         # flatten label and prediction tensors
         inputs = inputs.view(-1)
         targets = targets.view(-1)
 
         intersection = (inputs * targets).sum()
-        dice = (2.*intersection + smooth) / \
-            (inputs.sum() + targets.sum() + smooth)
+        fbeta = ((1 + self.beta**2)*intersection + smooth) / \
+            (inputs.sum() + self.beta**2 * targets.sum() + smooth)
 
-        return 1 - dice
+        return fbeta
 
 
-class IoU(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(IoU, self).__init__()
+def score_function(engine):
+    """
+    ignite.handlers.EarlyStopping では指定スコアが上がると改善したと判定する。
+    そのため今回のロスに -1 をかけたものを ignite.handlers.EarlyStopping オブジェクトに渡す
+    """
+    val_loss = engine.state.metrics["loss"]
+    return -val_loss
 
-    def forward(self, inputs, targets, smooth=1):
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        intersection = (inputs * targets).sum()
-        total = (inputs + targets).sum()
-        union = total - intersection
 
-        IoU = (intersection + smooth)/(union + smooth)
+def train(cfg):
+    """
+    学習コードはpytorch igniteを利用してコンパクトに書く
+    """
+    # データセットの取得、分割
+    dataset = LoadDataSet(
+        "../dataset/", transforms=get_train_transform())
 
-        return IoU
+    train_size = int(np.round(dataset.__len__()
+                     * (1 - cfg.split_ratio), 0))
+    valid_size = dataset.__len__() - train_size
+
+    train_dataset, valid_dataset = random_split(
+        dataset, [train_size, valid_size])
+    train_loader = DataLoader(dataset=train_dataset,
+                              batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(
+        dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # モデル、デバイス、最適化手法、損失関数、ロガーの定義
+    model = UNet(4, 1).cuda()
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    # optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
+    # 画像内の正解ピクセル数に対して背景ピクセル数が大きい=正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
+    # criterion = nn.CrossEntropyLoss()
+    criterion = DiceBCELoss()
+    accuracy_metric = FBetaScore(beta=0.5)
+
+    valid_loss_min = np.inf
+    checkpoint_path = "../model/chkpoint_"
+    best_model_path = "../model/bestmodel.pt"
+
+    total_train_loss = []
+    total_train_score = []
+    total_valid_loss = []
+    total_valid_score = []
+
+    losses_value = 0
+
+    for epoch in range(cfg.epochs):
+        train_loss = []
+        train_score = []
+        valid_loss = []
+        valid_score = []
+        pbar = tqdm(train_loader, desc="description")
+        for x_train, y_train in pbar:
+            x_train = torch.autograd.Variable(x_train).cuda()
+            y_train = torch.autograd.Variable(y_train).cuda()
+            optimizer.zero_grad()
+            output = model(x_train)
+            loss = criterion(output, y_train)
+            losses_value = loss.item()
+
+            score = accuracy_metric(output, y_train)
+            loss.backward()
+            optimizer.step()
+            train_loss.append(losses_value)
+            train_score.append(score.item())
+            pbar.set_description(f"""
+            Epch: {epoch+1}
+            loss: {losses_value}
+            Fbeta: {score}
+            """)
+
+        with torch.no_grad():
+            for image, mask in val_loader:
+                image = torch.autograd.Variable(image).cuda()
+                mask = torch.autograd.Variable(mask).cuda()
+                output = model(image)
+
+                loss = criterion(output, mask)
+                losses_value = loss.item()
+
+                score = accuracy_metric(output, mask)
+                valid_loss.append(losses_value)
+                valid_score.append(score.item())
+
+            total_train_loss.append(np.mean(train_loss))
+            total_train_score.append(np.mean(train_score))
+            total_valid_loss.append(np.mean(valid_loss))
+            total_valid_score.append(np.mean(valid_score))
+            print(
+                f"Train Loss:{total_train_loss[-1]}, Train Fbeta: {total_train_score[-1]}")
+            print(
+                f"Valid Loss:{total_valid_loss[-1]}, Valid Fbeta: {total_valid_score[-1]}")
+
+            checkpoint = {
+                "epoch": epoch + 1,
+                "valid_loss_min": total_valid_loss[-1],
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            torch.save(checkpoint, checkpoint_path)
+            if total_valid_loss[-1] <= valid_loss_min:
+                print(
+                    f"Validation loss decreased ({valid_loss_min:.6f} --> {total_valid_loss[-1]:.6f}).  Saving model ...")
+                torch.save(checkpoint, best_model_path)
+                valid_loss_min = total_valid_loss[-1]
+
+            print("")
+
+    results = {
+        "total_train_loss": total_train_loss,
+        "total_valid_loss": total_valid_loss,
+        "total_train_score": total_train_score,
+        "total_valid_score": total_valid_score,
+    }
+
+    return results
+
+
+def visualize(results, epochs):
+    plt.figure(1)
+    plt.figure(figsize=(15, 5))
+    sns.set_style(style="darkgrid")
+    plt.subplot(1, 2, 1)
+    sns.lineplot(x=range(1, epochs+1),
+                 y=results["total_train_loss"], label="Train Loss")
+    sns.lineplot(x=range(1, epochs+1),
+                 y=results["total_valid_loss"], label="Valid Loss")
+    plt.title("Loss")
+    plt.xlabel("epochs")
+    plt.ylabel("DiceBCELoss")
+
+    plt.subplot(1, 2, 2)
+    sns.lineplot(x=range(1, epochs+1),
+                 y=results["total_train_score"], label="Train Score")
+    sns.lineplot(x=range(1, epochs+1),
+                 y=results["total_valid_score"], label="Valid Score")
+    plt.title("Score (Fbeta@0.5)")
+    plt.xlabel("epochs")
+    plt.ylabel("Fbeta@0.5")
+    plt.savefig("../model/model_eval.png")
+
+
+# def train(cfg):
+#     """
+#     学習コードはpytorch igniteを利用してコンパクトに書く
+#     """
+#     # データセットの取得、分割
+#     dataset = LoadDataSet(
+#         "../dataset/", transforms=get_train_transform())
+
+#     train_size = int(np.round(dataset.__len__()
+#                      * (1 - cfg.split_ratio), 0))
+#     valid_size = dataset.__len__() - train_size
+
+#     train_dataset, valid_dataset = random_split(
+#         dataset, [train_size, valid_size])
+#     train_loader = DataLoader(dataset=train_dataset,
+#                               batch_size=BATCH_SIZE, shuffle=True)
+#     val_loader = DataLoader(
+#         dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+#     # モデル、デバイス、最適化手法、損失関数、ロガーの定義
+#     model = UNet(4, 1).cuda()
+#     model.to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+#     # optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
+#     # 画像内の正解ピクセル数に対して背景ピクセル数が大きい=正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
+#     # criterion = nn.CrossEntropyLoss()
+#     criterion = DiceBCELoss()
+#     # criterion = DiceLoss()
+
+#     # 学習器の設定
+#     trainer = create_supervised_trainer(
+#         model, optimizer, criterion, device=device)
+
+#     # 評価指標の定義 : f-beta and loss to compute on val dataset
+#     P = ignite.metrics.Precision(average=False)
+#     R = ignite.metrics.Recall(average=False)
+#     metrics = {
+#         # 精度評価、コンペのルール参照
+#         "f-beta@0.5": ignite.metrics.Fbeta(beta=0.5, precision=P, recall=R),
+#         "loss": ignite.metrics.Loss(criterion)  # 損失関数
+#     }
+
+#     train_evaluator = create_supervised_evaluator(
+#         model, metrics=metrics, device=device)
+#     validation_evaluator = create_supervised_evaluator(
+#         model, metrics=metrics, device=device)
+
+#     # 中間結果をprintする
+#     @trainer.on(Events.EPOCH_COMPLETED)
+#     def log_training_result(engine):
+#         train_evaluator.run(train_loader)
+#         metrics = train_evaluator.state.metrics
+#         print(f"""===Training Results===\
+#             Epoch: {engine.state.epoch}
+#             Avg f-beta@0.5: {metrics["f-beta@0.5"]:.2f}
+#             Avg loss: {metrics["loss"]:.2f}""")
+
+#     @trainer.on(Events.EPOCH_COMPLETED)
+#     def log_validation_result(engine):
+#         validation_evaluator.run(val_loader)
+#         metrics = validation_evaluator.state.metrics
+#         print(f"""---Validation Results---\
+#             Epoch: {engine.state.epoch}
+#             Avg f-beta@0.5: {metrics["f-beta@0.5"]:.2f}
+#             Avg loss: {metrics["loss"]:.2f}""")
+
+#     # ロガーの定義 : 使い慣れているmlflowを用いる
+#     mlflow_logger = MLflowLogger(tracking_uri=cfg.log_dir)
+
+#     mlflow_logger.log_params({
+#         "random_seed": RANDOM_SEED,
+#         "train_size": train_size,
+#         "pytorch version": torch.__version__,
+#         "ignite version": ignite.__version__,
+#         "cuda version": torch.version.cuda,
+#         "device name": torch.cuda.get_device_name(0)
+#     })
+
+#     # イテレーションごとに損失関数を記録する
+#     mlflow_logger.attach_output_handler(
+#         trainer,
+#         event_name=Events.ITERATION_COMPLETED,
+#         tag="training",
+#         output_transform=lambda loss: {"loss": loss}
+#     )
+
+#     # エポック終了時損失関数と精度を記録する
+#     # TODO train_evaluatorとvalidation_evaluatorを分ける意味は？
+#     mlflow_logger.attach_output_handler(
+#         train_evaluator,
+#         event_name=Events.EPOCH_COMPLETED,
+#         tag="training",
+#         metric_names=["loss", "f-beta@0.5"],
+#         global_step_transform=global_step_from_engine(trainer),
+#     )
+
+#     mlflow_logger.attach_output_handler(
+#         validation_evaluator,
+#         event_name=Events.EPOCH_COMPLETED,
+#         tag="validation",
+#         metric_names=["loss", "f-beta@0.5"],
+#         global_step_transform=global_step_from_engine(trainer),
+#     )
+
+#     mlflow_logger.attach(
+#         trainer,
+#         log_handler=OptimizerParamsHandler(optimizer),
+#         event_name=Events.ITERATION_STARTED
+#     )
+
+#     handler = EarlyStopping(
+#         patience=10, score_function=score_function, trainer=trainer)
+#     train_evaluator.add_event_handler(Events.COMPLETED, handler)
+
+#     trainer.run(train_loader, max_epochs=cfg.epochs)
+#     mlflow_logger.close()
 
 
 if __name__ == "__main__":
+    # parseagrs
+    parser = ArgumentParser()
+    parser.add_argument("--split_ratio", type=float, default=0.25)
+    parser.add_argument("--epochs", type=int, default=19)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--log_dir", type=str, default="mlruns")
+    cfg = parser.parse_args()
 
     # path
+    print("\n===Define Path===\n")
     ROOT_DIR = Path.cwd().parent.resolve()
     print("root path:", ROOT_DIR)
-    MLRUN_PATH = ROOT_DIR.parents[0] / "mlruns"
+    MLRUN_PATH = ROOT_DIR.parents[0] / cfg.log_dir
     if MLRUN_PATH.exists():
         print("MLRUN path:", MLRUN_PATH)
     else:
@@ -343,124 +555,31 @@ if __name__ == "__main__":
         exit()
 
     # competition name(= experiment name)
+    print("\n===Set Experiment Name===\n")
     EXPERIMENT_NAME = ROOT_DIR.name
     print("experiment name:", EXPERIMENT_NAME)
 
-    print(f"\n GPU SETUP \n")
+    print(f"\n===Check GPU Available===\n")
     if torch.cuda.is_available():
         print(f"RUNNING ON GPU - {torch.cuda.get_device_name()}")
     else:
         print(f"RUNNING ON CPU")
 
-    # mlflow settings
-    nowstr = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    print(f"torch version is {torch.__version__}\n")
-    # mlflow.set_tracking_uri(str(MLRUN_PATH) + "/")
-    # mlflow.set_experiment(EXPERIMENT_NAME)
-    # mlflow.start_run(run_name=nowstr)
+    # logger作成
+    logger = logging.getLogger("ignite.engine.engine.Engine")
+    handler = logging.StreamHandler()
 
-    # random seed
-    RANDOM_SEED = 126
-    # mlflow.log_param(key="random_seed", value=RANDOM_SEED)
+    formatter = logging.Formatter(
+        "%(asctime)s %(name)-12s %(levelname)-8s %(message)s")
+    handler.setFormatter(formatter)
+    # ロガーに追加
+    logger.addHandler(handler)
+    # ログレベルの設定
+    logger.setLevel(logging.INFO)
 
-    train_dataset = LoadDataSet(
-        "../dataset/", transforms=get_train_transform())
+    print(f"\n===Start Training===\n")
+    # train(cfg)
+    results = train(cfg)
 
-    visualize_dataset(3)
-
-    train_size = int(np.round(train_dataset.__len__()*(1 - SPLIT_RATIO), 0))
-    valid_size = int(np.round(train_dataset.__len__()*SPLIT_RATIO, 0))
-    train_data, valid_data = random_split(
-        train_dataset, [train_size, valid_size])
-    train_loader = DataLoader(dataset=train_data,
-                              batch_size=10, shuffle=True)
-    val_loader = DataLoader(dataset=valid_data, batch_size=10)
-
-    # print("Length of train data: {}".format(len(train_data)))
-    # print("Length of validation data: {}".format(len(valid_data)))
-
-    # # <---------------各インスタンス作成---------------------->
-    # model = UNet(3, 1).cuda()
-    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    # criterion = DiceLoss()
-    # accuracy_metric = IoU()
-    # num_epochs = 20
-    # valid_loss_min = np.Inf
-
-    # checkpoint_path = 'model/chkpoint_'
-    # best_model_path = 'model/bestmodel.pt'
-
-    # total_train_loss = []
-    # total_train_score = []
-    # total_valid_loss = []
-    # total_valid_score = []
-
-    # losses_value = 0
-    # for epoch in range(num_epochs):
-    #     # <---------------トレーニング---------------------->
-    #     train_loss = []
-    #     train_score = []
-    #     valid_loss = []
-    #     valid_score = []
-    #     pbar = tqdm(train_loader, desc='description')
-    #     for x_train, y_train in pbar:
-    #         x_train = torch.autograd.Variable(x_train).cuda()
-    #         y_train = torch.autograd.Variable(y_train).cuda()
-    #         optimizer.zero_grad()
-    #         output = model(x_train)
-    #         # 損失計算
-    #         loss = criterion(output, y_train)
-    #         losses_value = loss.item()
-    #         # 精度評価
-    #         score = accuracy_metric(output, y_train)
-    #         loss.backward()
-    #         optimizer.step()
-    #         train_loss.append(losses_value)
-    #         train_score.append(score.item())
-    #         pbar.set_description(
-    #             f"Epoch: {epoch+1}, loss: {losses_value}, IoU: {score}")
-    #     # <---------------評価---------------------->
-    #     with torch.no_grad():
-    #         for image, mask in val_loader:
-    #             image = torch.autograd.Variable(image).cuda()
-    #             mask = torch.autograd.Variable(mask).cuda()
-    #             output = model(image)
-    #             # 損失計算
-    #             loss = criterion(output, mask)
-    #             losses_value = loss.item()
-    #             # 精度評価
-    #             score = accuracy_metric(output, mask)
-    #             valid_loss.append(losses_value)
-    #             valid_score.append(score.item())
-
-    #     total_train_loss.append(np.mean(train_loss))
-    #     total_train_score.append(np.mean(train_score))
-    #     total_valid_loss.append(np.mean(valid_loss))
-    #     total_valid_score.append(np.mean(valid_score))
-    #     print(
-    #         f"Train Loss: {total_train_loss[-1]}, Train IOU: {total_train_score[-1]}")
-    #     print(
-    #         f"Valid Loss: {total_valid_loss[-1]}, Valid IOU: {total_valid_score[-1]}")
-
-    #     checkpoint = {
-    #         'epoch': epoch + 1,
-    #         'valid_loss_min': total_valid_loss[-1],
-    #         'state_dict': model.state_dict(),
-    #         'optimizer': optimizer.state_dict(),
-    #     }
-
-    #     # checkpointの保存
-    #     torch.save_ckp(checkpoint, False, checkpoint_path, best_model_path)
-
-    #     # 評価データにおいて最高精度のモデルのcheckpointの保存
-    #     if total_valid_loss[-1] <= valid_loss_min:
-    #         print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(
-    #             valid_loss_min, total_valid_loss[-1]))
-    #         torch.save_ckp(checkpoint, True, checkpoint_path, best_model_path)
-    #         valid_loss_min = total_valid_loss[-1]
-
-    #     print("")
-    # train_path_df = path_df[path_df.index.isin(train_idx)]
-    # validation_path_df = path_df[path_df.index.isin(val_idx)]
-
-    # mlflow.end_run()
+    print(f"\n===Save Training Results===\n")
+    visualize(results, cfg.epochs)
