@@ -7,6 +7,7 @@ from pathlib import Path
 from random import random
 
 import ignite
+import mlflow
 import numpy as np
 import seaborn as sns
 import torch
@@ -18,11 +19,11 @@ from ignite.contrib.handlers.mlflow_logger import *
 from ignite.engine import (Events, create_supervised_evaluator,
                            create_supervised_trainer)
 from ignite.handlers import EarlyStopping
+from ignite.metrics import Precision, Recall
 from matplotlib import pyplot as plt
 from skimage import io, transform
 from torch import nn, no_grad
 from torch.utils.data import DataLoader, Dataset, random_split
-from torchmetrics import Accuracy, Precision, Recall
 from tqdm import tqdm as tqdm
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -105,9 +106,6 @@ class LoadDataSet(Dataset):
         augmented = self.transforms(
             image=img_0_vh, image0=img_0_vv, image1=img_1_vh, image2=img_1_vv, mask=raw_mask)
 
-        # imgs = [augmented["image"].float(), augmented["image0"].float(),
-        #         augmented["image1"].float(), augmented["image2"].float()]
-        # mask = augmented["mask"].float()
         imgs = [augmented["image"], augmented["image0"],
                 augmented["image1"], augmented["image2"]]
         _mask = augmented["mask"]
@@ -116,6 +114,9 @@ class LoadDataSet(Dataset):
         img = torch.cat(imgs, dim=0)
 
         return (img, mask)
+
+# 以下URLを写経
+# https://obgynai.com/unet-semantic-segmentation/
 
 
 class UNet(nn.Module):
@@ -222,8 +223,9 @@ def up_pooling(in_channels, out_channels, kernel_size=2, stride=2):
 
 class DiceBCELoss(nn.Module):
     """
-    Binary Cross Entropy + DiceLoss
-    DiceLoss = 1 - DiceCoefficient
+    BinaryCrossEntropy + DiceLoss
+    DiceLoss = 1 - DiceCoeff
+    smooth back propagationを行う際に関数平面の平滑化を行って計算が進むようにする
     """
 
     def __init__(self, weight=None, size_average=True):
@@ -246,9 +248,9 @@ class DiceBCELoss(nn.Module):
 
 class FBetaScore(nn.Module):
     """
-    重み付きF Score算出関数
+    WeightedFScore class
     beta = 1の時Dice係数と同じ
-    smoothはゼロ除算対策
+    const zerodivision対策
     """
 
     def __init__(self, beta: float = 1., threshold: float = 0.5):
@@ -256,8 +258,8 @@ class FBetaScore(nn.Module):
         self.beta = beta
         self.threshold = threshold
 
-    def forward(self, inputs, targets, smooth=1):
-        # Binarize probablity
+    def forward(self, inputs, targets, const=1e-7):
+        # Binarize probablities
         inputs = torch.where(inputs < self.threshold, 0, 1)
 
         # flatten label and prediction tensors
@@ -265,10 +267,18 @@ class FBetaScore(nn.Module):
         targets = targets.view(-1)
 
         intersection = (inputs * targets).sum()
-        fbeta = ((1 + self.beta**2)*intersection + smooth) / \
-            (inputs.sum() + self.beta**2 * targets.sum() + smooth)
+        fbeta = ((1 + self.beta**2)*intersection) / \
+            (inputs.sum() + self.beta**2 * targets.sum() + const)
 
         return fbeta
+
+
+def thresholded_output_transform(x, y, y_pred):
+    """
+    convert from prob to binary function
+    """
+    y_pred = torch.round(y_pred)
+    return y_pred, y
 
 
 def score_function(engine):
@@ -283,6 +293,7 @@ def score_function(engine):
 def train(cfg):
     """
     学習コードはpytorch igniteを利用してコンパクトに書く
+    ->あまりに隠蔽されすぎてエラー発生時対処できないので一端forLoop
     """
     # データセットの取得、分割
     dataset = LoadDataSet(
@@ -304,8 +315,6 @@ def train(cfg):
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     # optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
-    # 画像内の正解ピクセル数に対して背景ピクセル数が大きい=正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
-    # criterion = nn.CrossEntropyLoss()
     criterion = DiceBCELoss()
     accuracy_metric = FBetaScore(beta=0.5)
 
@@ -416,138 +425,19 @@ def visualize(results, epochs):
     plt.savefig("../model/model_eval.png")
 
 
-# def train(cfg):
-#     """
-#     学習コードはpytorch igniteを利用してコンパクトに書く
-#     """
-#     # データセットの取得、分割
-#     dataset = LoadDataSet(
-#         "../dataset/", transforms=get_train_transform())
-
-#     train_size = int(np.round(dataset.__len__()
-#                      * (1 - cfg.split_ratio), 0))
-#     valid_size = dataset.__len__() - train_size
-
-#     train_dataset, valid_dataset = random_split(
-#         dataset, [train_size, valid_size])
-#     train_loader = DataLoader(dataset=train_dataset,
-#                               batch_size=BATCH_SIZE, shuffle=True)
-#     val_loader = DataLoader(
-#         dataset=valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-#     # モデル、デバイス、最適化手法、損失関数、ロガーの定義
-#     model = UNet(4, 1).cuda()
-#     model.to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-#     # optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
-#     # 画像内の正解ピクセル数に対して背景ピクセル数が大きい=正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
-#     # criterion = nn.CrossEntropyLoss()
-#     criterion = DiceBCELoss()
-#     # criterion = DiceLoss()
-
-#     # 学習器の設定
-#     trainer = create_supervised_trainer(
-#         model, optimizer, criterion, device=device)
-
-#     # 評価指標の定義 : f-beta and loss to compute on val dataset
-#     P = ignite.metrics.Precision(average=False)
-#     R = ignite.metrics.Recall(average=False)
-#     metrics = {
-#         # 精度評価、コンペのルール参照
-#         "f-beta@0.5": ignite.metrics.Fbeta(beta=0.5, precision=P, recall=R),
-#         "loss": ignite.metrics.Loss(criterion)  # 損失関数
-#     }
-
-#     train_evaluator = create_supervised_evaluator(
-#         model, metrics=metrics, device=device)
-#     validation_evaluator = create_supervised_evaluator(
-#         model, metrics=metrics, device=device)
-
-#     # 中間結果をprintする
-#     @trainer.on(Events.EPOCH_COMPLETED)
-#     def log_training_result(engine):
-#         train_evaluator.run(train_loader)
-#         metrics = train_evaluator.state.metrics
-#         print(f"""===Training Results===\
-#             Epoch: {engine.state.epoch}
-#             Avg f-beta@0.5: {metrics["f-beta@0.5"]:.2f}
-#             Avg loss: {metrics["loss"]:.2f}""")
-
-#     @trainer.on(Events.EPOCH_COMPLETED)
-#     def log_validation_result(engine):
-#         validation_evaluator.run(val_loader)
-#         metrics = validation_evaluator.state.metrics
-#         print(f"""---Validation Results---\
-#             Epoch: {engine.state.epoch}
-#             Avg f-beta@0.5: {metrics["f-beta@0.5"]:.2f}
-#             Avg loss: {metrics["loss"]:.2f}""")
-
-#     # ロガーの定義 : 使い慣れているmlflowを用いる
-#     mlflow_logger = MLflowLogger(tracking_uri=cfg.log_dir)
-
-#     mlflow_logger.log_params({
-#         "random_seed": RANDOM_SEED,
-#         "train_size": train_size,
-#         "pytorch version": torch.__version__,
-#         "ignite version": ignite.__version__,
-#         "cuda version": torch.version.cuda,
-#         "device name": torch.cuda.get_device_name(0)
-#     })
-
-#     # イテレーションごとに損失関数を記録する
-#     mlflow_logger.attach_output_handler(
-#         trainer,
-#         event_name=Events.ITERATION_COMPLETED,
-#         tag="training",
-#         output_transform=lambda loss: {"loss": loss}
-#     )
-
-#     # エポック終了時損失関数と精度を記録する
-#     # TODO train_evaluatorとvalidation_evaluatorを分ける意味は？
-#     mlflow_logger.attach_output_handler(
-#         train_evaluator,
-#         event_name=Events.EPOCH_COMPLETED,
-#         tag="training",
-#         metric_names=["loss", "f-beta@0.5"],
-#         global_step_transform=global_step_from_engine(trainer),
-#     )
-
-#     mlflow_logger.attach_output_handler(
-#         validation_evaluator,
-#         event_name=Events.EPOCH_COMPLETED,
-#         tag="validation",
-#         metric_names=["loss", "f-beta@0.5"],
-#         global_step_transform=global_step_from_engine(trainer),
-#     )
-
-#     mlflow_logger.attach(
-#         trainer,
-#         log_handler=OptimizerParamsHandler(optimizer),
-#         event_name=Events.ITERATION_STARTED
-#     )
-
-#     handler = EarlyStopping(
-#         patience=10, score_function=score_function, trainer=trainer)
-#     train_evaluator.add_event_handler(Events.COMPLETED, handler)
-
-#     trainer.run(train_loader, max_epochs=cfg.epochs)
-#     mlflow_logger.close()
-
-
 if __name__ == "__main__":
     # parseagrs
     parser = ArgumentParser()
     parser.add_argument("--split_ratio", type=float, default=0.25)
-    parser.add_argument("--epochs", type=int, default=19)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--log_dir", type=str, default="mlruns")
     cfg = parser.parse_args()
 
     # path
     print("\n===Define Path===\n")
     ROOT_DIR = Path.cwd().parent.resolve()
     print("root path:", ROOT_DIR)
-    MLRUN_PATH = ROOT_DIR.parents[0] / cfg.log_dir
+    MLRUN_PATH = ROOT_DIR.parents[0] / "mlruns"
     if MLRUN_PATH.exists():
         print("MLRUN path:", MLRUN_PATH)
     else:
@@ -578,7 +468,6 @@ if __name__ == "__main__":
     logger.setLevel(logging.INFO)
 
     print(f"\n===Start Training===\n")
-    # train(cfg)
     results = train(cfg)
 
     print(f"\n===Save Training Results===\n")
