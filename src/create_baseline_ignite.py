@@ -16,6 +16,7 @@ from albumentations import (Compose, Flip, GaussNoise, Normalize, Resize,
                             Rotate, ShiftScaleRotate)
 from albumentations.pytorch import ToTensorV2
 from ignite.contrib.handlers.mlflow_logger import *
+from ignite.contrib.handlers.param_scheduler import LRScheduler
 from ignite.engine import (Events, create_supervised_evaluator,
                            create_supervised_trainer)
 from ignite.handlers import EarlyStopping, ModelCheckpoint
@@ -23,14 +24,15 @@ from ignite.metrics import Precision, Recall
 from matplotlib import pyplot as plt
 from skimage import io
 from torch import nn
-from torch.optim.lr_scheduler import ExponentialLR
+from torch.optim.lr_scheduler import ExponentialLR, StepLR
 from torch.utils.data import DataLoader, Dataset, random_split
+from torchsummary import summary
 from tqdm import tqdm as tqdm
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu")
 
-# warnings.simplefilter("ignore", category=DeprecationWarning)
+warnings.simplefilter("ignore", category=DeprecationWarning)
 config = configparser.ConfigParser()
 config.read("../configs/config.ini")
 CHANNEL_LIST = ["0_VH", "0_VV", "1_VH", "1_VV"]
@@ -54,8 +56,8 @@ def get_train_transform():
     return Compose(
         [
             # リサイズ
-            Resize(config.getint("GENERAL", "IMAGE_SIZE"),
-                   config.getint("GENERAL", "IMAGE_SIZE")),
+            Resize(config.getint("AUGMENTATION", "IMAGE_SIZE"),
+                   config.getint("AUGMENTATION", "IMAGE_SIZE")),
             # ランダム回転
             Rotate(p=1),
             # 水平、垂直、水平垂直のいずれかにランダム反転
@@ -63,8 +65,8 @@ def get_train_transform():
             # 正規化(予め平均と標準偏差は計算しておく？)
             # albumentationsはピクセル値域が0~255のunit8を返すので
             # std=1, mean=0で正規化を施してfloat32型にしておく
-            Normalize(mean=config.getfloat("GENERAL", "MEAN"),
-                      std=config.getfloat("GENERAL", "STD")),
+            Normalize(mean=config.getfloat("AUGMENTATION", "MEAN"),
+                      std=config.getfloat("AUGMENTATION", "STD")),
             # テンソル化
             ToTensorV2()
         ],
@@ -311,24 +313,29 @@ def train(generator):
         "../dataset/", transforms=get_train_transform())
 
     train_size = int(np.round(dataset.__len__()
-                     * (1 - config.getfloat("GENERAL", "split_ratio")), 0))
+                     * (1 - config.getfloat("LEARNING", "split_ratio")), 0))
     valid_size = dataset.__len__() - train_size
 
     train_dataset, valid_dataset = random_split(
         dataset, [train_size, valid_size])
-    train_loader = DataLoader(dataset=train_dataset, batch_size=config.getint("GENERAL", "BATCH_SIZE"),
+    train_loader = DataLoader(dataset=train_dataset, batch_size=config.getint("LEARNING", "BATCH_SIZE"),
                               shuffle=True, worker_init_fn=seed_worker, generator=generator)
-    val_loader = DataLoader(dataset=valid_dataset, batch_size=config.getint("GENERAL", "BATCH_SIZE"),
+    val_loader = DataLoader(dataset=valid_dataset, batch_size=config.getint("LEARNING", "BATCH_SIZE"),
                             shuffle=False, worker_init_fn=seed_worker, generator=generator)
+
+    print(train_loader[0].size())
 
     # モデル生成、デバイス割り当て、最適化手法、損失関数、ロガーの定義
     model = UNet(4, 1)
-
     model.to(device)
 
-    # optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=config.getfloat("GENERAL", "lr"), momentum=1e-3)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.getfloat("LEARNING", "lr"))
+   # optimizer = torch.optim.SGD(
+   #     model.parameters(), lr=config.getfloat("LEARNING", "lr"), momentum=config.getfloat("LEARNING", "momentum"))
+
+    step_scheduler = StepLR(optimizer, step_size=100, gamma=0.1)
+    lr_scheduler = LRScheduler(step_scheduler)
 
     # 画像内の正解ピクセル数に対して背景ピクセル数が大.つまり
     # 正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
@@ -383,12 +390,12 @@ def train(generator):
 
     mlflow_logger.log_params({
         "random_seed": config.getint("GENERAL", "RANDOM_SEED"),
-        "image size": config.getint("GENERAL", "IMAGE_SIZE"),
-        "batch size": config.getint("GENERAL", "BATCH_SIZE"),
+        "image size": config.getint("AUGMENTATION", "IMAGE_SIZE"),
+        "batch size": config.getint("LEARNING", "BATCH_SIZE"),
         "model": model.__class__.__name__,
         "optimizer": optimizer.__class__.__name__,
         "train size": train_size,
-        "early stopping patience": config.getint("GENERAL", "RANDOM_SEED"),
+        "early stopping patience": config.getint("LEARNING", "PATIENCE"),
         "device name": f"{torch.cuda.get_device_name()}" if torch.cuda.is_available() else device,
         "pytorch version": torch.__version__,
         "ignite version": ignite.__version__,
@@ -428,22 +435,28 @@ def train(generator):
         event_name=Events.ITERATION_STARTED
     )
 
+    trainer.add_event_handler(Events.ITERATION_COMPLETED, lr_scheduler)
+
     # Early Stoppingの実装
     handler = EarlyStopping(
-        patience=config.getint("GENERAL", "PATIENCE"), score_function=score_function, trainer=trainer)
+        patience=config.getint("LEARNING", "PATIENCE"), score_function=score_function, trainer=trainer)
     train_evaluator.add_event_handler(Events.COMPLETED, handler)
 
     # Checkpointの保存
-    handler = ModelCheckpoint(
-        "../model/", None, n_saved=2, create_dir=True, save_as_state_dict=True)
-    trainer.add_event_handler(Events.EPOCH_COMPLETED(
-        every=2), handler, {"mymodel": model})
+    # 計算時間が長いならコメントアウト
+    # handler = ModelCheckpoint(
+    #     "../model/", "", n_saved=2, create_dir=True, save_as_state_dict=True)
+    # trainer.add_event_handler(Events.EPOCH_COMPLETED(
+    #     every=2), handler, {"mymodel": model})
 
     # 学習
-    trainer.run(train_loader, max_epochs=config.getint("GENERAL", "epochs"))
+    trainer.run(train_loader, max_epochs=config.getint("LEARNING", "epochs"))
 
     # Modelの保存
     mlflow.pytorch.log_model(model, model.__class__.__name__)
+    model_info = str(summary(model, verbose=0))
+    with open("../model/unet_schema.txt", "w") as f:
+        f.write(model_info)
 
     mlflow_logger.close()
 
@@ -486,13 +499,10 @@ if __name__ == "__main__":
     print("\n===Create Loggers===\n")
     logger = logging.getLogger("ignite.engine.engine.Engine")
     handler = logging.StreamHandler()
-
     formatter = logging.Formatter(
         "%(asctime)s %(name)-12s %(levelname)-8s %(message)s")
     handler.setFormatter(formatter)
-    # ロガーに追加
     logger.addHandler(handler)
-    # ログレベルの設定
     logger.setLevel(logging.INFO)
 
     print(f"\n===Start Training===\n")
