@@ -1,6 +1,8 @@
 # For data analysis
 *.csv
+*.png
 dataset/
 submit/
 model/
-test.py
+tmp/
+src/test.py
