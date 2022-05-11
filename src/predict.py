@@ -109,7 +109,7 @@ def visualize(idx, images, size):
         plt.imshow(image, cmap='gray', vmin=0, vmax=1)
 
     io.imsave(
-        f'../submit/test_predictions/pred_{str(idx).zfill(2)}.png', img_as_uint(resized_images[-1]))
+        f'../submit/test_predictions/test_{str(idx).zfill(2)}.png', img_as_uint(resized_images[-1]))
     plt.savefig(
         f"../dataset/tmp/prediction_comparision/pred_comp_{str(idx).zfill(2)}.png")
    # plt.show()

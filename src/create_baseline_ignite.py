@@ -9,19 +9,17 @@ from pathlib import Path
 import ignite
 import mlflow
 import numpy as np
-import seaborn as sns
 import torch
 import torch.nn.functional as F
-from albumentations import (Compose, Flip, GaussNoise, Normalize, Resize,
-                            Rotate, ShiftScaleRotate)
+from albumentations import Compose, Flip, Normalize, RandomCrop, Resize, Rotate
 from albumentations.pytorch import ToTensorV2
+from ignite.contrib.handlers import ProgressBar
 from ignite.contrib.handlers.mlflow_logger import *
 from ignite.contrib.handlers.param_scheduler import LRScheduler
-from ignite.engine import (Events, create_supervised_evaluator,
-                           create_supervised_trainer)
-from ignite.handlers import EarlyStopping, ModelCheckpoint
-from ignite.metrics import Precision, Recall
-from matplotlib import pyplot as plt
+from ignite.engine import (Engine, Events, create_supervised_evaluator,
+                           create_supervised_trainer, supervised_training_step)
+from ignite.handlers import EarlyStopping, global_step_from_engine
+from ignite.metrics import Accuracy, Loss, Precision, Recall, RunningAverage
 from skimage import io
 from torch import nn
 from torch.optim.lr_scheduler import ExponentialLR, StepLR
@@ -56,13 +54,17 @@ def get_train_transform():
     return Compose(
         [
             # リサイズ
-            Resize(config.getint("AUGMENTATION", "IMAGE_SIZE"),
-                   config.getint("AUGMENTATION", "IMAGE_SIZE")),
+            # Resize(config.getint("AUGMENTATION", "IMAGE_SIZE"),
+            #        config.getint("AUGMENTATION", "IMAGE_SIZE")),
             # ランダム回転
             Rotate(p=1),
             # 水平、垂直、水平垂直のいずれかにランダム反転
-            Flip(p=1),
+            Flip(p=0.5),
+            # ランダム切り取り
+            RandomCrop(p=1, height=config.getint(
+                "AUGMENTATION", "IMAGE_SIZE"), width=config.getint("AUGMENTATION", "IMAGE_SIZE")),
             # 正規化(予め平均と標準偏差は計算しておく？)
+
             # albumentationsはピクセル値域が0~255のunit8を返すので
             # std=1, mean=0で正規化を施してfloat32型にしておく
             Normalize(mean=config.getfloat("AUGMENTATION", "MEAN"),
@@ -260,31 +262,12 @@ class DiceBCELoss(nn.Module):
         return Dice_BCE
 
 
-class FBetaScore(nn.Module):
-    """
-    WeightedFScore class
-    beta = 1の時Dice係数と同じ
-    const zerodivision対策
-    """
-
-    def __init__(self, beta: float = 1., threshold: float = 0.5):
-        super(FBetaScore, self).__init__()
-        self.beta = beta
-        self.threshold = threshold
-
-    def forward(self, inputs, targets, const=1e-7):
-        # Binarize probablities
-        inputs = torch.where(inputs < self.threshold, 0, 1)
-
-        # flatten label and prediction tensors
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-
-        intersection = (inputs * targets).sum()
-        fbeta = ((1 + self.beta**2)*intersection) / \
-            (inputs.sum() + self.beta**2 * targets.sum() + const)
-
-        return fbeta
+def fscore(beta, eps=1e-7):
+    precision = Precision(average=False)
+    recall = Recall(average=False)
+    fbeta = ((1 + beta**2) * precision * recall /
+             ((beta ** 2) * precision + recall + eps)).mean()
+    return fbeta
 
 
 def thresholded_output_transform(x, y, y_pred):
@@ -323,38 +306,38 @@ def train(generator):
     val_loader = DataLoader(dataset=valid_dataset, batch_size=config.getint("LEARNING", "BATCH_SIZE"),
                             shuffle=False, worker_init_fn=seed_worker, generator=generator)
 
-    print(train_loader[0].size())
-
     # モデル生成、デバイス割り当て、最適化手法、損失関数、ロガーの定義
     model = UNet(4, 1)
     model.to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config.getfloat("LEARNING", "lr"))
-   # optimizer = torch.optim.SGD(
-   #     model.parameters(), lr=config.getfloat("LEARNING", "lr"), momentum=config.getfloat("LEARNING", "momentum"))
+    # optimizer = torch.optim.SGD(
+    #     model.parameters(), lr=config.getfloat("LEARNING", "lr"), momentum=config.getfloat("LEARNING", "momentum"))
 
-    step_scheduler = StepLR(optimizer, step_size=100, gamma=0.1)
-    lr_scheduler = LRScheduler(step_scheduler)
+    scheduler = StepLR(optimizer, step_size=config.getfloat(
+        "LEARNING", "step_size"), gamma=config.getfloat("LEARNING", "gamma"))
+    # scheduler = ExponentialLR(
+    #     optimizer, gamma=config.getfloat("LEARNING", "gamma"))
+    lr_scheduler = LRScheduler(scheduler)
 
     # 画像内の正解ピクセル数に対して背景ピクセル数が大.つまり
     # 正解不正解の頻度差が大きいのでCE Loss系は学習が上手くいかない
     # criterion = nn.CrossEntropyLoss()
     criterion = DiceBCELoss()
-
-    precision = Precision(average=False)
-    recall = Recall(average=False)
-    F05 = ((1 + 0.5**2) * precision * recall /
-           ((0.5 ** 2) * precision + recall + 1e-7)).mean()
+    fbeta = fscore(beta=0.5)
 
     # 学習器の設定
+    # update_fn = supervised_training_step(
+    #     model, optimizer, criterion, gradient_accumulation_steps=2)
+    # trainer = Engine(update_fn)
     trainer = create_supervised_trainer(
-        model, optimizer, criterion, device=device)
+        model=model, optimizer=optimizer, loss_fn=criterion, device=device)
 
     # 評価指標の定義 : f-beta and loss to compute on val dataset
     metrics = {
         # 精度評価、コンペのルール参照
-        "f_score_05": F05,
+        "f_score_05": fbeta,
         "loss": ignite.metrics.Loss(criterion)  # 損失関数
     }
 
@@ -363,31 +346,15 @@ def train(generator):
     validation_evaluator = create_supervised_evaluator(
         model, metrics=metrics, device=device, output_transform=thresholded_output_transform)
 
-    # 中間結果をprintする
-    @ trainer.on(Events.EPOCH_COMPLETED)
-    def log_training_result(engine):
-        train_evaluator.run(train_loader)
-        metrics = train_evaluator.state.metrics
-        print(f"""===Training Results===
-        Epoch: {engine.state.epoch}
-        Avg F-score_05: {metrics["f_score_05"]:.2f}
-        Avg loss: {metrics["loss"]:.2f}""")
+    pbar = ProgressBar(persist=False)
+    pbar.attach(trainer, metric_names="all")
 
-    @ trainer.on(Events.EPOCH_COMPLETED)
-    def log_validation_result(engine):
-        validation_evaluator.run(val_loader)
-        metrics = validation_evaluator.state.metrics
-        print(f"""---Validation Results---
-        Epoch: {engine.state.epoch}
-        Avg F-score_05: {metrics["f_score_05"]:.2f}
-        Avg loss: {metrics["loss"]:.2f}""")
-
-    # ロガーの定義 : mlflowを用いる
+   # ロガーの定義 : mlflowを用いる
     mlflow.set_tracking_uri(config.get("GENERAL", "MLRUN_PATH"))
     mlflow.set_experiment(config.get("GENERAL", "EXPERIMENT_NAME"))
     mlflow_logger = MLflowLogger(
         tracking_uri=config.get("GENERAL", "MLRUN_PATH"))
-
+    # param記入
     mlflow_logger.log_params({
         "random_seed": config.getint("GENERAL", "RANDOM_SEED"),
         "image size": config.getint("AUGMENTATION", "IMAGE_SIZE"),
@@ -402,45 +369,55 @@ def train(generator):
         "cuda version": torch.version.cuda,
     })
 
+    @ trainer.on(Events.EPOCH_COMPLETED)
+    def log_training_result(engine):
+        train_evaluator.run(train_loader)
+        metrics = train_evaluator.state.metrics
+        avg_fscore = metrics["f_score_05"]
+        avg_loss = metrics["loss"]
+        pbar.log_message(
+            f"Training Results - Epoch: {engine.state.epoch} Avg f-score: {avg_fscore:.2f} Avg loss: {avg_loss:.2f}")
+
+    @ trainer.on(Events.EPOCH_COMPLETED)
+    def log_validation_result(engine):
+        validation_evaluator.run(val_loader)
+        metrics = validation_evaluator.state.metrics
+        avg_fscore = metrics["f_score_05"]
+        avg_loss = metrics["loss"]
+        pbar.log_message(
+            f"Validation Results - Epoch: {engine.state.epoch} Avg f-score: {avg_fscore:.2f} Avg loss: {avg_loss:.2f}")
+        pbar.n = pbar.last_print_n = 0
+
     # イテレーションごとに損失関数を記録する
     mlflow_logger.attach_output_handler(
         trainer,
         event_name=Events.ITERATION_COMPLETED,
         tag="training",
-        output_transform=lambda loss: {"loss": loss}
+        output_transform=lambda loss: {"batchloss": loss}
     )
 
     # エポック終了時損失関数と精度を記録する
-    # TODO train_evaluatorとvalidation_evaluatorを分ける意味は？
-    mlflow_logger.attach_output_handler(
-        train_evaluator,
-        event_name=Events.EPOCH_COMPLETED,
-        tag="training",
-        metric_names=["loss", "f_score_05"],
-        global_step_transform=global_step_from_engine(trainer),
-    )
-
-    mlflow_logger.attach_output_handler(
-        validation_evaluator,
-        event_name=Events.EPOCH_COMPLETED,
-        tag="validation",
-        metric_names=["loss", "f_score_05"],
-        global_step_transform=global_step_from_engine(trainer),
-    )
+    for tag, evaluator in [("training", train_evaluator), ("validation", validation_evaluator)]:
+        mlflow_logger.attach_output_handler(
+            evaluator,
+            event_name=Events.EPOCH_COMPLETED,
+            tag=tag,
+            metric_names=["loss", "f_score_05"],
+            global_step_transform=global_step_from_engine(trainer),
+        )
 
     # Optimizerのパラメータを記録する
-    mlflow_logger.attach(
-        trainer,
-        log_handler=OptimizerParamsHandler(optimizer),
-        event_name=Events.ITERATION_STARTED
+    mlflow_logger.attach_opt_params_handler(
+        trainer, event_name=Events.ITERATION_COMPLETED(every=config.getint("LOG", "interval")), optimizer=optimizer
     )
 
-    trainer.add_event_handler(Events.ITERATION_COMPLETED, lr_scheduler)
+    # lrの更新
+    trainer.add_event_handler(Events.ITERATION_STARTED, lr_scheduler)
 
     # Early Stoppingの実装
     handler = EarlyStopping(
         patience=config.getint("LEARNING", "PATIENCE"), score_function=score_function, trainer=trainer)
-    train_evaluator.add_event_handler(Events.COMPLETED, handler)
+    validation_evaluator.add_event_handler(Events.COMPLETED, handler)
 
     # Checkpointの保存
     # 計算時間が長いならコメントアウト
@@ -454,6 +431,7 @@ def train(generator):
 
     # Modelの保存
     mlflow.pytorch.log_model(model, model.__class__.__name__)
+    mlflow.log_artifact("../configs/config.ini")
     model_info = str(summary(model, verbose=0))
     with open("../model/unet_schema.txt", "w") as f:
         f.write(model_info)
@@ -503,7 +481,7 @@ if __name__ == "__main__":
         "%(asctime)s %(name)-12s %(levelname)-8s %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.WARNING)
 
     print(f"\n===Start Training===\n")
     train(g)

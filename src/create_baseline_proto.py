@@ -12,8 +12,8 @@ import numpy as np
 import seaborn as sns
 import torch
 import torch.nn.functional as F
-from albumentations import (Compose, Flip, GaussNoise, Normalize, Resize,
-                            Rotate, ShiftScaleRotate)
+from albumentations import (Compose, Flip, GaussNoise, Normalize, RandomCrop,
+                            Resize, Rotate)
 from albumentations.pytorch import ToTensorV2
 from ignite.contrib.handlers.mlflow_logger import *
 from ignite.engine import (Events, create_supervised_evaluator,
@@ -31,7 +31,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 warnings.simplefilter("ignore", category=DeprecationWarning)
 
 # constants
-BATCH_SIZE = 1
+BATCH_SIZE = 4
 MEAN = 0
 STD = 1
 RANDOM_SEED = 126
@@ -44,12 +44,11 @@ def get_train_transform():
     """
     return Compose(
         [
-            # リサイズ
-            Resize(256, 256),
-            # ランダム回転
             Rotate(p=1),
             # 水平、垂直、水平垂直のいずれかにランダム反転
-            Flip(p=1),
+            Flip(p=0.5),
+            # ランダム切り取り
+            RandomCrop(p=1, height=256, width=256),
             # 正規化(予め平均と標準偏差は計算しておく？)
             # albumentationsは値域が0~255のunit8を返すので
             # std=1, mean=0で正規化を施してfloat32型にしておく
@@ -419,7 +418,7 @@ def visualize(results, epochs):
                  y=results["total_train_score"], label="Train Score")
     sns.lineplot(x=range(1, epochs+1),
                  y=results["total_valid_score"], label="Valid Score")
-    plt.title("Score (Fbeta@0.5)")
+    plt.title("Accuracy")
     plt.xlabel("epochs")
     plt.ylabel("Fbeta@0.5")
     plt.savefig("../model/model_eval.png")
@@ -429,7 +428,7 @@ if __name__ == "__main__":
     # parseagrs
     parser = ArgumentParser()
     parser.add_argument("--split_ratio", type=float, default=0.25)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     cfg = parser.parse_args()
 
