@@ -16,10 +16,12 @@ from albumentations.pytorch import ToTensorV2
 from ignite.contrib.handlers import ProgressBar
 from ignite.contrib.handlers.mlflow_logger import *
 from ignite.contrib.handlers.param_scheduler import LRScheduler
+from ignite.contrib.handlers.tensorboard_logger import *
 from ignite.engine import (Engine, Events, create_supervised_evaluator,
                            create_supervised_trainer, supervised_training_step)
 from ignite.handlers import EarlyStopping, global_step_from_engine
-from ignite.metrics import Accuracy, Loss, Precision, Recall, RunningAverage
+from ignite.metrics import (Accuracy, Fbeta, Loss, Precision, Recall,
+                            RunningAverage)
 from skimage import io
 from torch import nn
 from torch.optim.lr_scheduler import ExponentialLR, StepLR
@@ -262,11 +264,37 @@ class DiceBCELoss(nn.Module):
         return Dice_BCE
 
 
-def fscore(beta, eps=1e-7):
-    precision = Precision(average=False)
-    recall = Recall(average=False)
-    fbeta = ((1 + beta**2) * precision * recall /
-             ((beta ** 2) * precision + recall + eps)).mean()
+class FBetaScore(nn.Module):
+    """
+    WeightedFScore class
+    beta = 1の時Dice係数と同じ
+    const zerodivision対策
+    """
+
+    def __init__(self, beta: float = 1., threshold: float = 0.5):
+        super(FBetaScore, self).__init__()
+        self.beta = beta
+        self.threshold = threshold
+
+    def forward(self, inputs, targets, const=1e-7):
+        # Binarize probablities
+        inputs = torch.where(inputs < self.threshold, 0, 1)
+
+        # flatten label and prediction tensors
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+
+        intersection = (inputs * targets).sum()
+        fbeta = ((1 + self.beta**2)*intersection) / \
+            (inputs.sum() + self.beta**2 * targets.sum() + const)
+
+        return fbeta
+
+
+def fscore(beta):
+    p = Precision(average=False)
+    r = Recall(average=False)
+    fbeta = Fbeta(beta=beta, precision=p, recall=r)
     return fbeta
 
 
@@ -311,7 +339,7 @@ def train(generator):
     model.to(device)
 
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.getfloat("LEARNING", "lr"))
+        model.parameters(), lr=config.getfloat("LEARNING", "lr"), eps=0.1)
     # optimizer = torch.optim.SGD(
     #     model.parameters(), lr=config.getfloat("LEARNING", "lr"), momentum=config.getfloat("LEARNING", "momentum"))
 
@@ -326,6 +354,7 @@ def train(generator):
     # criterion = nn.CrossEntropyLoss()
     criterion = DiceBCELoss()
     fbeta = fscore(beta=0.5)
+    # fbeta = FBetaScore(beta=0.5)
 
     # 学習器の設定
     # update_fn = supervised_training_step(
@@ -341,11 +370,16 @@ def train(generator):
         "loss": ignite.metrics.Loss(criterion)  # 損失関数
     }
 
+    # train_evaluator = create_supervised_evaluator(
+    #     model, metrics=metrics, device=device, output_transform=thresholded_output_transform)
+    # valid_evaluator = create_supervised_evaluator(
+    #     model, metrics=metrics, device=device, output_transform=thresholded_output_transform)
     train_evaluator = create_supervised_evaluator(
-        model, metrics=metrics, device=device, output_transform=thresholded_output_transform)
-    validation_evaluator = create_supervised_evaluator(
-        model, metrics=metrics, device=device, output_transform=thresholded_output_transform)
+        model, metrics=metrics, device=device)
+    valid_evaluator = create_supervised_evaluator(
+        model, metrics=metrics, device=device)
 
+    # プログレスバーの実装
     pbar = ProgressBar(persist=False)
     pbar.attach(trainer, metric_names="all")
 
@@ -369,6 +403,14 @@ def train(generator):
         "cuda version": torch.version.cuda,
     })
 
+    # イテレーションごとに損失関数を記録する
+    mlflow_logger.attach_output_handler(
+        trainer,
+        event_name=Events.ITERATION_COMPLETED,
+        tag="training",
+        output_transform=lambda loss: {"batchloss": loss}
+    )
+
     @ trainer.on(Events.EPOCH_COMPLETED)
     def log_training_result(engine):
         train_evaluator.run(train_loader)
@@ -380,24 +422,16 @@ def train(generator):
 
     @ trainer.on(Events.EPOCH_COMPLETED)
     def log_validation_result(engine):
-        validation_evaluator.run(val_loader)
-        metrics = validation_evaluator.state.metrics
+        valid_evaluator.run(val_loader)
+        metrics = valid_evaluator.state.metrics
         avg_fscore = metrics["f_score_05"]
         avg_loss = metrics["loss"]
         pbar.log_message(
             f"Validation Results - Epoch: {engine.state.epoch} Avg f-score: {avg_fscore:.2f} Avg loss: {avg_loss:.2f}")
         pbar.n = pbar.last_print_n = 0
 
-    # イテレーションごとに損失関数を記録する
-    mlflow_logger.attach_output_handler(
-        trainer,
-        event_name=Events.ITERATION_COMPLETED,
-        tag="training",
-        output_transform=lambda loss: {"batchloss": loss}
-    )
-
     # エポック終了時損失関数と精度を記録する
-    for tag, evaluator in [("training", train_evaluator), ("validation", validation_evaluator)]:
+    for tag, evaluator in [("training", train_evaluator), ("validation", valid_evaluator)]:
         mlflow_logger.attach_output_handler(
             evaluator,
             event_name=Events.EPOCH_COMPLETED,
@@ -417,7 +451,7 @@ def train(generator):
     # Early Stoppingの実装
     handler = EarlyStopping(
         patience=config.getint("LEARNING", "PATIENCE"), score_function=score_function, trainer=trainer)
-    validation_evaluator.add_event_handler(Events.COMPLETED, handler)
+    valid_evaluator.add_event_handler(Events.COMPLETED, handler)
 
     # Checkpointの保存
     # 計算時間が長いならコメントアウト
@@ -484,6 +518,6 @@ if __name__ == "__main__":
     logger.setLevel(logging.WARNING)
 
     print(f"\n===Start Training===\n")
-    train(g)
+    t_history, v_history = train(g)
 
     print(f"\n===Training Finished===\n")
