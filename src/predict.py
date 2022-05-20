@@ -15,7 +15,7 @@ config = configparser.ConfigParser()
 config.read("../configs/config.ini")
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-run_id = "fd371da79c0746a18f0f0985d7964fc2"
+run_id = "83b3343cc4f14c479ab2a6aa76cb0eba"
 model_name = "UNet"
 
 
@@ -26,12 +26,12 @@ def get_train_transform():
     return Compose(
         [
             # リサイズ
-            Resize(config.getint("AUGMENTATION", "IMAGE_SIZE"),
-                   config.getint("AUGMENTATION", "IMAGE_SIZE")),
+            Resize(config.getint("AUGMENTATION", "image_size"),
+                   config.getint("AUGMENTATION", "image_size")),
             # albumentationsはピクセル値域が0~255のunit8を返すので
             # std=1, mean=0で正規化を施してfloat32型にしておく
-            Normalize(mean=config.getfloat("AUGMENTATION", "MEAN"),
-                      std=config.getfloat("AUGMENTATION", "STD")),
+            Normalize(mean=config.getfloat("AUGMENTATION", "mean"),
+                      std=config.getfloat("AUGMENTATION", "std")),
             # テンソル化
             ToTensorV2()
         ],
@@ -109,9 +109,10 @@ def visualize(idx, images, size):
         plt.imshow(image, cmap='gray', vmin=0, vmax=1)
 
     io.imsave(
-        f'../submit/test_predictions/test_{str(idx).zfill(2)}.png', img_as_uint(resized_images[-1]))
+        f'../submit/test_predictions/test_{str(idx).zfill(2)}.png', img_as_uint(resized_images[-1]), check_contrast=False)
     plt.savefig(
-        f"../dataset/tmp/prediction_comparision/pred_comp_{str(idx).zfill(2)}.png")
+        f"../tmp/prediction_comparision/pred_comp_{str(idx).zfill(2)}.png")
+    plt.close()
    # plt.show()
 
 
@@ -119,12 +120,12 @@ def predict():
     test_dataset = LoadDataSet(
         "../dataset/")
 
-    mlflow.set_tracking_uri(config.get("GENERAL", "MLRUN_PATH"))
-    mlflow.set_experiment(config.get("GENERAL", "EXPERIMENT_NAME"))
+    mlflow.set_tracking_uri(config.get("GENERAL", "mlrun_path"))
+    mlflow.set_experiment(config.get("GENERAL", "experiment_name"))
     model_uri = f"runs:/{run_id}/{model_name}"
     loaded_model = mlflow.pytorch.load_model(model_uri)
 
-    for idx in range(config.getint("PREDICTION", "TEST_BATCH_SIZE")):
+    for idx in range(config.getint("PREDICTION", "test_batch_size")):
 
         images, size = test_dataset[idx]
         images = images.to(device).unsqueeze(0)

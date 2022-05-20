@@ -40,22 +40,10 @@ def get_train_transform():
             # リサイズ
             Resize(config.getint("AUGMENTATION", "image_size"),
                    config.getint("AUGMENTATION", "image_size")),
-
             # ランダム回転
             Rotate(p=1),
             # 水平、垂直、水平垂直のいずれかにランダム反転
             Flip(p=1),
-
-            # --aug ver2--
-            # # ランダム回転
-            # Rotate(p=1),
-            # # 水平、垂直、水平垂直のいずれかにランダム反転
-            # Flip(p=0.5),
-            # # ランダム切り取り
-            # RandomCrop(p=1, height=config.getint(
-            #     "AUGMENTATION", "IMAGE_SIZE"), width=config.getint("AUGMENTATION", "IMAGE_SIZE")),
-
-
             # 正規化(予め平均と標準偏差は計算しておく？)
             # albumentationsは値域が0~255のunit8を返すので
             # std=1, mean=0で正規化を施してfloat32型にしておく
